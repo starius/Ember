@@ -143,11 +143,14 @@ struct SingularEvidence {
     node_pv: bool,
     node_beta: i32,
     actual_depth: i32,
+    minimum_depth: i32,
     halfmove_clock: u8,
     repetitions: u8,
     repeated_after_root: bool,
     shuffling: bool,
     path_extensions: u8,
+    path_budget: u8,
+    margin_bonus_cp: i32,
     allow_lower_bound: bool,
     tt_move: Option<Move>,
     tt_score: Option<i32>,
@@ -335,6 +338,7 @@ fn singular_margin(evidence: SingularEvidence) -> i32 {
         + i32::from(!evidence.tt_pv) * 16
         + i32::from(!evidence.node_pv) * 8
         + i32::from(evidence.tt_age) * 8
+        + evidence.margin_bonus_cp
 }
 
 fn singular_path_budget(depth: i32) -> u8 {
@@ -345,7 +349,7 @@ fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
     if !evidence.enabled {
         return SingularEligibility::NoCandidate(SingularRejection::Disabled);
     }
-    if evidence.actual_depth < SINGULAR_MIN_DEPTH {
+    if evidence.actual_depth < evidence.minimum_depth {
         return SingularEligibility::NoCandidate(SingularRejection::ShallowNode);
     }
     let (Some(mv), Some(score), Some(flag)) =
@@ -389,7 +393,7 @@ fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
         Some(SingularRejection::PriorRepetition)
     } else if evidence.shuffling {
         Some(SingularRejection::Shuffling)
-    } else if evidence.path_extensions >= singular_path_budget(evidence.actual_depth) {
+    } else if evidence.path_extensions >= evidence.path_budget {
         Some(SingularRejection::PathBudget)
     } else if !evidence.tt_move_is_legal {
         Some(SingularRejection::IllegalTtMove)
@@ -411,7 +415,8 @@ fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
         positive_extension,
         max_extension: if positive_extension {
             i32::from(
-                singular_path_budget(evidence.actual_depth)
+                evidence
+                    .path_budget
                     .saturating_sub(evidence.path_extensions),
             )
         } else {
@@ -794,6 +799,9 @@ pub struct SearchDebug {
     pub enable_singular_multi_extensions: bool,
     pub enable_singular_multicut: bool,
     pub enable_singular_negative_extensions: bool,
+    singular_minimum_depth: i32,
+    singular_margin_bonus_cp: i32,
+    singular_path_budget: Option<u8>,
     trace_roots: bool,
     trace_singular_candidates: bool,
     dag: SearchDagTrace,
@@ -1828,8 +1836,9 @@ macro_rules! negamax_mode_body {
             $this.singular_extensions_enabled() && !$this.restricted_verification_active();
         let singular_policy_enabled =
             $this.singular_multicut_enabled() || $this.singular_negative_extensions_enabled();
+        let singular_minimum_depth = $this.singular_minimum_depth();
         let inspect_singular_safety = singular_enabled
-            && actual_depth >= SINGULAR_MIN_DEPTH
+            && actual_depth >= singular_minimum_depth
             && tt_depth >= actual_depth - SINGULAR_TT_DEPTH_MARGIN
             && (tt_flag == Some(TT_EXACT) && tt_pv
                 || singular_policy_enabled && tt_flag == Some(TT_BETA))
@@ -1857,11 +1866,14 @@ macro_rules! negamax_mode_body {
             node_pv: is_pv,
             node_beta: beta,
             actual_depth,
+            minimum_depth: singular_minimum_depth,
             halfmove_clock: $st.halfmove_clock,
             repetitions,
             repeated_after_root,
             shuffling: $this.singular_shuffling($ply, $st.halfmove_clock),
             path_extensions: $this.singular_path_extensions($ply),
+            path_budget: $this.singular_path_budget(actual_depth),
+            margin_bonus_cp: $this.singular_margin_bonus_cp(),
             allow_lower_bound: singular_policy_enabled,
             tt_move,
             tt_score,
@@ -2904,7 +2916,12 @@ impl Searcher {
             eprintln!(
                 "info string search-debug singular-gates \
                  {{\"depth\":{depth},\"order\":{order},\"move\":\"{mv}\",\
-                 \"nodes\":{nodes},\"rejections\":{{{rejections}}}}}"
+                 \"nodes\":{nodes},\"minimum_depth\":{},\
+                 \"margin_bonus_cp\":{},\"path_budget\":{},\
+                 \"rejections\":{{{rejections}}}}}",
+                self.singular_minimum_depth(),
+                self.singular_margin_bonus_cp(),
+                self.singular_path_budget(depth),
             );
         }
         if !self.debug.trace_roots {
@@ -3024,6 +3041,7 @@ impl Searcher {
              \"tt_pv\":{},\"tt_age\":{},\
              \"threshold\":{},\"verification_depth\":{},\
              \"verification_score\":{},\"verification_nodes\":{},\
+             \"minimum_depth\":{},\"margin_bonus_cp\":{},\"path_budget\":{},\
              \"halfmove_clock\":{},\"repetitions\":{},\
              \"repeated_after_root\":{},\"shuffling\":{},\
              \"path_extensions\":{},\"capture\":{},\"promotion\":{},\
@@ -3046,6 +3064,9 @@ impl Searcher {
             verification_depth,
             verification_score,
             verification_nodes,
+            self.singular_minimum_depth(),
+            self.singular_margin_bonus_cp(),
+            self.singular_path_budget(depth),
             st.halfmove_clock,
             repetitions,
             repeated_after_root,
@@ -3156,6 +3177,41 @@ impl Searcher {
     #[inline(always)]
     fn singular_extensions_enabled(&self) -> bool {
         false
+    }
+
+    #[cfg(feature = "search-debug")]
+    fn singular_minimum_depth(&self) -> i32 {
+        self.debug.singular_minimum_depth
+    }
+
+    #[cfg(not(feature = "search-debug"))]
+    #[inline(always)]
+    fn singular_minimum_depth(&self) -> i32 {
+        SINGULAR_MIN_DEPTH
+    }
+
+    #[cfg(feature = "search-debug")]
+    fn singular_margin_bonus_cp(&self) -> i32 {
+        self.debug.singular_margin_bonus_cp
+    }
+
+    #[cfg(not(feature = "search-debug"))]
+    #[inline(always)]
+    fn singular_margin_bonus_cp(&self) -> i32 {
+        0
+    }
+
+    #[cfg(feature = "search-debug")]
+    fn singular_path_budget(&self, depth: i32) -> u8 {
+        self.debug
+            .singular_path_budget
+            .unwrap_or_else(|| singular_path_budget(depth))
+    }
+
+    #[cfg(not(feature = "search-debug"))]
+    #[inline(always)]
+    fn singular_path_budget(&self, depth: i32) -> u8 {
+        singular_path_budget(depth)
     }
 
     #[cfg(any(feature = "search-debug", test))]
@@ -4527,6 +4583,13 @@ impl SearchDebug {
             enable_singular_negative_extensions: env_flag(
                 "EMBER_ENABLE_SINGULAR_NEGATIVE_EXTENSIONS",
             ),
+            singular_minimum_depth: env_i32("EMBER_SINGULAR_MIN_DEPTH")
+                .unwrap_or(SINGULAR_MIN_DEPTH)
+                .clamp(1, 64),
+            singular_margin_bonus_cp: env_i32("EMBER_SINGULAR_MARGIN_BONUS_CP")
+                .unwrap_or(0)
+                .clamp(-200, 1_000),
+            singular_path_budget: env_u8("EMBER_SINGULAR_PATH_BUDGET").map(|budget| budget.min(3)),
             trace_roots: env_flag("EMBER_TRACE_ROOT_SEARCH"),
             trace_singular_candidates: env_flag("EMBER_TRACE_SINGULAR_CANDIDATES"),
             dag: SearchDagTrace::from_env(),
@@ -4551,6 +4614,16 @@ fn env_flag(name: &str) -> bool {
 
 #[cfg(feature = "search-debug")]
 fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+#[cfg(feature = "search-debug")]
+fn env_i32(name: &str) -> Option<i32> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
+#[cfg(feature = "search-debug")]
+fn env_u8(name: &str) -> Option<u8> {
     std::env::var(name).ok()?.parse().ok()
 }
 
@@ -5520,11 +5593,14 @@ mod tests {
             node_pv: true,
             node_beta: 100,
             actual_depth: SINGULAR_MIN_DEPTH,
+            minimum_depth: SINGULAR_MIN_DEPTH,
             halfmove_clock: 0,
             repetitions: 1,
             repeated_after_root: false,
             shuffling: false,
             path_extensions: 0,
+            path_budget: singular_path_budget(SINGULAR_MIN_DEPTH),
+            margin_bonus_cp: 0,
             allow_lower_bound: false,
             tt_move: Some(mv),
             tt_score: Some(300),
@@ -6146,6 +6222,32 @@ mod tests {
                 ..evidence
             }),
             SingularEligibility::SafetyRejected(SingularRejection::SearchCycle)
+        );
+    }
+
+    #[test]
+    fn singular_candidate_accepts_debug_policy_overrides() {
+        let mv = encode_move(0, 0, 0, 1, 0);
+        let evidence = qualifying_singular_evidence(mv);
+        let tuned = SingularEvidence {
+            actual_depth: 8,
+            minimum_depth: 8,
+            path_budget: 1,
+            margin_bonus_cp: 40,
+            ..evidence
+        };
+        let SingularEligibility::Eligible(candidate) = singular_candidate(tuned) else {
+            panic!("tuned Singular evidence was rejected");
+        };
+        assert_eq!(candidate.beta, 300 - singular_margin(tuned));
+        assert_eq!(candidate.max_extension, 1);
+
+        assert_eq!(
+            singular_candidate(SingularEvidence {
+                path_extensions: 1,
+                ..tuned
+            }),
+            SingularEligibility::SafetyRejected(SingularRejection::PathBudget)
         );
     }
 

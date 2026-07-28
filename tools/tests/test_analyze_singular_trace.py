@@ -86,6 +86,17 @@ class TraceSummaryTests(unittest.TestCase):
             {"shallow_node": 7, "unsupported_bound": 2},
         )
 
+    def test_summary_groups_effective_policy(self):
+        summary = MODULE.summarize(
+            [
+                event(minimum_depth=12, margin_bonus_cp=0, path_budget=2),
+                event(minimum_depth=12, margin_bonus_cp=40, path_budget=1),
+            ]
+        )
+        self.assertEqual(set(summary["by_minimum_depth"]), {"12"})
+        self.assertEqual(set(summary["by_margin_bonus_cp"]), {"0", "40"})
+        self.assertEqual(set(summary["by_path_budget"]), {"1", "2"})
+
 
 class UciParsingTests(unittest.TestCase):
     def test_parse_centipawn_line(self):

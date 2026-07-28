@@ -146,6 +146,15 @@ def summarize(events, rejections=None):
         "by_path_extensions": group_summary(
             events, lambda event: event.get("path_extensions", "unknown")
         ),
+        "by_minimum_depth": group_summary(
+            events, lambda event: event.get("minimum_depth", "unknown")
+        ),
+        "by_margin_bonus_cp": group_summary(
+            events, lambda event: event.get("margin_bonus_cp", "unknown")
+        ),
+        "by_path_budget": group_summary(
+            events, lambda event: event.get("path_budget", "unknown")
+        ),
         "by_capture": group_summary(events, lambda event: event["capture"]),
         "by_promotion": group_summary(events, lambda event: event["promotion"]),
     }
