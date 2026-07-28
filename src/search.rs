@@ -6284,6 +6284,7 @@ mod tests {
         let mut evidence = qualifying_singular_evidence(encode_move(0, 0, 0, 1, 0));
         evidence.actual_depth = SINGULAR_TRIPLE_MIN_DEPTH;
         evidence.tt_depth = SINGULAR_TRIPLE_MIN_DEPTH;
+        evidence.path_budget = singular_path_budget(SINGULAR_TRIPLE_MIN_DEPTH);
         let SingularEligibility::Eligible(candidate) = singular_candidate(evidence) else {
             panic!("qualifying TT evidence was rejected");
         };
