@@ -58,6 +58,7 @@ class SearchBenchmarkProtocolTests(unittest.TestCase):
         self.assertEqual(sample["reported_depth"], 7)
         self.assertEqual(sample["nodes"], 1234)
         self.assertEqual(sample["nps"], 12000)
+        self.assertEqual(sample["bestmove"], "e2e4")
         self.assertGreaterEqual(sample["wall_seconds"], 0.1)
 
 

@@ -25,6 +25,7 @@ DEFAULT_POSITIONS = [
 
 
 INFO_RE = re.compile(r"^info .*?\bdepth\s+(\d+).*?\bnodes\s+(\d+).*?\bnps\s+(\d+)\b")
+BESTMOVE_RE = re.compile(r"^bestmove\s+(\S+)")
 
 
 def now_id():
@@ -116,6 +117,14 @@ def parse_last_info(output):
     return infos[-1] if infos else None
 
 
+def parse_bestmove(output):
+    for line in reversed(output.splitlines()):
+        match = BESTMOVE_RE.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
 def parse_binary_arg(value):
     if "=" not in value:
         raise argparse.ArgumentTypeError("expected LABEL=PATH")
@@ -177,13 +186,15 @@ def bench_once(binary, position, depth, hash_mb, threads, timeout, disable_book)
         timeout,
     )
     parsed = parse_last_info(proc.stdout)
-    if proc.returncode != 0 or parsed is None or "bestmove " not in proc.stdout:
+    bestmove = parse_bestmove(proc.stdout)
+    if proc.returncode != 0 or parsed is None or bestmove is None:
         raise RuntimeError(f"benchmark failed for {binary} on {label}\n{proc.stdout}")
     return {
         "position": label,
         "reported_depth": parsed["depth"],
         "nodes": parsed["nodes"],
         "nps": parsed["nps"],
+        "bestmove": bestmove,
         "wall_seconds": wall,
     }
 
@@ -264,13 +275,14 @@ def write_report(path, result):
         "",
         "## Per-position nps",
         "",
-        "| Binary | Position | Repeat | Depth | Nodes | NPS | Wall s |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Binary | Position | Repeat | Depth | Nodes | NPS | Best move | Wall s |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |",
     ])
     for row in result["samples"]:
         lines.append(
             f"| {row['label']} | {row['position']} | {row['repeat']} | "
-            f"{row['reported_depth']} | {row['nodes']} | {row['nps']} | {row['wall_seconds']:.3f} |"
+            f"{row['reported_depth']} | {row['nodes']} | {row['nps']} | "
+            f"{row['bestmove']} | {row['wall_seconds']:.3f} |"
         )
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
