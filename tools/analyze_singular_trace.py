@@ -149,6 +149,12 @@ def summarize(events, rejections=None):
         "by_minimum_depth": group_summary(
             events, lambda event: event.get("minimum_depth", "unknown")
         ),
+        "by_policy_minimum_depth": group_summary(
+            events, lambda event: event.get("policy_minimum_depth", "unknown")
+        ),
+        "by_lower_bound_extensions": group_summary(
+            events, lambda event: event.get("lower_bound_extensions", "unknown")
+        ),
         "by_margin_bonus_cp": group_summary(
             events, lambda event: event.get("margin_bonus_cp", "unknown")
         ),

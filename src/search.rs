@@ -144,6 +144,7 @@ struct SingularEvidence {
     node_beta: i32,
     actual_depth: i32,
     minimum_depth: i32,
+    policy_minimum_depth: i32,
     halfmove_clock: u8,
     repetitions: u8,
     repeated_after_root: bool,
@@ -152,6 +153,7 @@ struct SingularEvidence {
     path_budget: u8,
     margin_bonus_cp: i32,
     allow_lower_bound: bool,
+    allow_lower_bound_extension: bool,
     tt_move: Option<Move>,
     tt_score: Option<i32>,
     tt_depth: i32,
@@ -357,8 +359,10 @@ fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
     else {
         return SingularEligibility::NoCandidate(SingularRejection::MissingTtEvidence);
     };
-    let positive_extension = flag == TT_EXACT && evidence.tt_pv;
-    let lower_bound_policy = evidence.allow_lower_bound && flag == TT_BETA;
+    let lower_bound_extension = evidence.allow_lower_bound_extension && flag == TT_BETA;
+    let positive_extension = flag == TT_EXACT && evidence.tt_pv || lower_bound_extension;
+    let lower_bound_policy =
+        evidence.allow_lower_bound && flag == TT_BETA && !lower_bound_extension;
     let reliable_bound = positive_extension || lower_bound_policy;
     if !reliable_bound {
         return SingularEligibility::NoCandidate(SingularRejection::UnsupportedBound);
@@ -369,9 +373,9 @@ fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
     if evidence.tt_age > SINGULAR_MAX_TT_AGE {
         return SingularEligibility::NoCandidate(SingularRejection::StaleTt);
     }
-    if lower_bound_policy
+    if (lower_bound_extension || lower_bound_policy)
         && (evidence.node_pv
-            || evidence.actual_depth < SINGULAR_POLICY_MIN_DEPTH
+            || evidence.actual_depth < evidence.policy_minimum_depth
             || evidence.node_beta.abs() >= MATE / 2
             || score < evidence.node_beta)
     {
@@ -796,10 +800,12 @@ pub struct SearchDebug {
     pub disable_reverse_futility: bool,
     pub disable_see_pruning: bool,
     pub enable_singular_extensions: bool,
+    pub enable_singular_lower_bound_extensions: bool,
     pub enable_singular_multi_extensions: bool,
     pub enable_singular_multicut: bool,
     pub enable_singular_negative_extensions: bool,
     singular_minimum_depth: i32,
+    singular_policy_minimum_depth: i32,
     singular_margin_bonus_cp: i32,
     singular_path_budget: Option<u8>,
     trace_roots: bool,
@@ -1836,12 +1842,15 @@ macro_rules! negamax_mode_body {
             $this.singular_extensions_enabled() && !$this.restricted_verification_active();
         let singular_policy_enabled =
             $this.singular_multicut_enabled() || $this.singular_negative_extensions_enabled();
+        let singular_lower_bound_extensions_enabled =
+            $this.singular_lower_bound_extensions_enabled();
         let singular_minimum_depth = $this.singular_minimum_depth();
         let inspect_singular_safety = singular_enabled
             && actual_depth >= singular_minimum_depth
             && tt_depth >= actual_depth - SINGULAR_TT_DEPTH_MARGIN
             && (tt_flag == Some(TT_EXACT) && tt_pv
-                || singular_policy_enabled && tt_flag == Some(TT_BETA))
+                || (singular_policy_enabled || singular_lower_bound_extensions_enabled)
+                    && tt_flag == Some(TT_BETA))
             && tt_age <= SINGULAR_MAX_TT_AGE
             && tt_move.is_some()
             && tt_score.is_some();
@@ -1867,6 +1876,7 @@ macro_rules! negamax_mode_body {
             node_beta: beta,
             actual_depth,
             minimum_depth: singular_minimum_depth,
+            policy_minimum_depth: $this.singular_policy_minimum_depth(),
             halfmove_clock: $st.halfmove_clock,
             repetitions,
             repeated_after_root,
@@ -1875,6 +1885,7 @@ macro_rules! negamax_mode_body {
             path_budget: $this.singular_path_budget(actual_depth),
             margin_bonus_cp: $this.singular_margin_bonus_cp(),
             allow_lower_bound: singular_policy_enabled,
+            allow_lower_bound_extension: singular_lower_bound_extensions_enabled,
             tt_move,
             tt_score,
             tt_depth,
@@ -2917,9 +2928,12 @@ impl Searcher {
                 "info string search-debug singular-gates \
                  {{\"depth\":{depth},\"order\":{order},\"move\":\"{mv}\",\
                  \"nodes\":{nodes},\"minimum_depth\":{},\
+                 \"policy_minimum_depth\":{},\"lower_bound_extensions\":{},\
                  \"margin_bonus_cp\":{},\"path_budget\":{},\
                  \"rejections\":{{{rejections}}}}}",
                 self.singular_minimum_depth(),
+                self.singular_policy_minimum_depth(),
+                self.singular_lower_bound_extensions_enabled(),
                 self.singular_margin_bonus_cp(),
                 self.singular_path_budget(depth),
             );
@@ -3041,7 +3055,9 @@ impl Searcher {
              \"tt_pv\":{},\"tt_age\":{},\
              \"threshold\":{},\"verification_depth\":{},\
              \"verification_score\":{},\"verification_nodes\":{},\
-             \"minimum_depth\":{},\"margin_bonus_cp\":{},\"path_budget\":{},\
+             \"minimum_depth\":{},\"policy_minimum_depth\":{},\
+             \"lower_bound_extensions\":{},\"margin_bonus_cp\":{},\
+             \"path_budget\":{},\
              \"halfmove_clock\":{},\"repetitions\":{},\
              \"repeated_after_root\":{},\"shuffling\":{},\
              \"path_extensions\":{},\"capture\":{},\"promotion\":{},\
@@ -3065,6 +3081,8 @@ impl Searcher {
             verification_score,
             verification_nodes,
             self.singular_minimum_depth(),
+            self.singular_policy_minimum_depth(),
+            self.singular_lower_bound_extensions_enabled(),
             self.singular_margin_bonus_cp(),
             self.singular_path_budget(depth),
             st.halfmove_clock,
@@ -3191,6 +3209,17 @@ impl Searcher {
     }
 
     #[cfg(feature = "search-debug")]
+    fn singular_policy_minimum_depth(&self) -> i32 {
+        self.debug.singular_policy_minimum_depth
+    }
+
+    #[cfg(not(feature = "search-debug"))]
+    #[inline(always)]
+    fn singular_policy_minimum_depth(&self) -> i32 {
+        SINGULAR_POLICY_MIN_DEPTH
+    }
+
+    #[cfg(feature = "search-debug")]
     fn singular_margin_bonus_cp(&self) -> i32 {
         self.debug.singular_margin_bonus_cp
     }
@@ -3243,6 +3272,16 @@ impl Searcher {
     #[cfg(not(feature = "search-debug"))]
     #[inline(always)]
     fn singular_multi_extensions_enabled(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "search-debug")]
+    fn singular_lower_bound_extensions_enabled(&self) -> bool {
+        self.debug.enable_singular_lower_bound_extensions
+    }
+    #[cfg(not(feature = "search-debug"))]
+    #[inline(always)]
+    fn singular_lower_bound_extensions_enabled(&self) -> bool {
         false
     }
 
@@ -4578,6 +4617,9 @@ impl SearchDebug {
             disable_reverse_futility: env_flag("EMBER_DISABLE_REVERSE_FUTILITY"),
             disable_see_pruning: env_flag("EMBER_DISABLE_SEE_PRUNING"),
             enable_singular_extensions: env_flag("EMBER_ENABLE_SINGULAR_EXTENSIONS"),
+            enable_singular_lower_bound_extensions: env_flag(
+                "EMBER_ENABLE_SINGULAR_LOWER_BOUND_EXTENSIONS",
+            ),
             enable_singular_multi_extensions: env_flag("EMBER_ENABLE_SINGULAR_MULTI_EXTENSIONS"),
             enable_singular_multicut: env_flag("EMBER_ENABLE_SINGULAR_MULTICUT"),
             enable_singular_negative_extensions: env_flag(
@@ -4585,6 +4627,9 @@ impl SearchDebug {
             ),
             singular_minimum_depth: env_i32("EMBER_SINGULAR_MIN_DEPTH")
                 .unwrap_or(SINGULAR_MIN_DEPTH)
+                .clamp(1, 64),
+            singular_policy_minimum_depth: env_i32("EMBER_SINGULAR_POLICY_MIN_DEPTH")
+                .unwrap_or(SINGULAR_POLICY_MIN_DEPTH)
                 .clamp(1, 64),
             singular_margin_bonus_cp: env_i32("EMBER_SINGULAR_MARGIN_BONUS_CP")
                 .unwrap_or(0)
@@ -5594,6 +5639,7 @@ mod tests {
             node_beta: 100,
             actual_depth: SINGULAR_MIN_DEPTH,
             minimum_depth: SINGULAR_MIN_DEPTH,
+            policy_minimum_depth: SINGULAR_POLICY_MIN_DEPTH,
             halfmove_clock: 0,
             repetitions: 1,
             repeated_after_root: false,
@@ -5602,6 +5648,7 @@ mod tests {
             path_budget: singular_path_budget(SINGULAR_MIN_DEPTH),
             margin_bonus_cp: 0,
             allow_lower_bound: false,
+            allow_lower_bound_extension: false,
             tt_move: Some(mv),
             tt_score: Some(300),
             tt_depth: SINGULAR_MIN_DEPTH - SINGULAR_TT_DEPTH_MARGIN,
@@ -6089,6 +6136,51 @@ mod tests {
         assert_eq!(lower_candidate.beta, allowed_lower_bound.node_beta);
         assert_eq!(lower_candidate.max_extension, 0);
 
+        let allowed_lower_extension = SingularEvidence {
+            allow_lower_bound: false,
+            allow_lower_bound_extension: true,
+            ..lower_bound
+        };
+        let SingularEligibility::Eligible(lower_extension) =
+            singular_candidate(allowed_lower_extension)
+        else {
+            panic!("enabled lower-bound extension evidence was rejected");
+        };
+        assert!(lower_extension.positive_extension);
+        assert_eq!(
+            lower_extension.beta,
+            allowed_lower_extension.tt_score.unwrap() - singular_margin(allowed_lower_extension)
+        );
+        assert_eq!(
+            lower_extension.max_extension,
+            i32::from(allowed_lower_extension.path_budget)
+        );
+
+        let lower_extension_rejections = [
+            SingularEvidence {
+                actual_depth: SINGULAR_POLICY_MIN_DEPTH - 1,
+                tt_depth: SINGULAR_POLICY_MIN_DEPTH - 1,
+                ..allowed_lower_extension
+            },
+            SingularEvidence {
+                node_pv: true,
+                ..allowed_lower_extension
+            },
+            SingularEvidence {
+                tt_score: Some(allowed_lower_extension.node_beta - 1),
+                ..allowed_lower_extension
+            },
+            SingularEvidence {
+                node_beta: MATE / 2,
+                tt_score: Some(MATE / 2),
+                ..allowed_lower_extension
+            },
+        ];
+        assert!(lower_extension_rejections.into_iter().all(|case| matches!(
+            singular_candidate(case),
+            SingularEligibility::NoCandidate(SingularRejection::LowerBoundContext)
+        )));
+
         let no_candidate_cases = [
             SingularEvidence {
                 actual_depth: SINGULAR_MIN_DEPTH - 1,
@@ -6339,6 +6431,11 @@ mod tests {
 
         searcher.debug.enable_singular_extensions = true;
         assert!(searcher.singular_extensions_enabled());
+
+        searcher.debug.enable_singular_lower_bound_extensions = false;
+        assert!(!searcher.singular_lower_bound_extensions_enabled());
+        searcher.debug.enable_singular_lower_bound_extensions = true;
+        assert!(searcher.singular_lower_bound_extensions_enabled());
 
         searcher.debug.enable_singular_multi_extensions = false;
         assert!(!searcher.singular_multi_extensions_enabled());

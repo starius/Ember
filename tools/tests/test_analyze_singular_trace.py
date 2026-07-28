@@ -90,10 +90,20 @@ class TraceSummaryTests(unittest.TestCase):
         summary = MODULE.summarize(
             [
                 event(minimum_depth=12, margin_bonus_cp=0, path_budget=2),
-                event(minimum_depth=12, margin_bonus_cp=40, path_budget=1),
+                event(
+                    minimum_depth=12,
+                    policy_minimum_depth=10,
+                    lower_bound_extensions=True,
+                    margin_bonus_cp=40,
+                    path_budget=1,
+                ),
             ]
         )
         self.assertEqual(set(summary["by_minimum_depth"]), {"12"})
+        self.assertEqual(set(summary["by_policy_minimum_depth"]), {"10", "unknown"})
+        self.assertEqual(
+            set(summary["by_lower_bound_extensions"]), {"True", "unknown"}
+        )
         self.assertEqual(set(summary["by_margin_bonus_cp"]), {"0", "40"})
         self.assertEqual(set(summary["by_path_budget"]), {"1", "2"})
 
