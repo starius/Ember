@@ -13,6 +13,7 @@ from collections import Counter, defaultdict
 
 
 TRACE_PREFIX = "info string search-debug singular-event "
+GATE_PREFIX = "info string search-debug singular-gates "
 MATE_SCORE = 100_000
 
 
@@ -47,6 +48,21 @@ def parse_trace_line(line):
     return event
 
 
+def parse_gate_line(line):
+    marker = line.find(GATE_PREFIX)
+    if marker < 0:
+        return None
+    payload = line[marker + len(GATE_PREFIX) :].strip()
+    summary = json.loads(payload)
+    rejections = summary.get("rejections")
+    if not isinstance(rejections, dict):
+        raise ValueError("singular gate summary is missing rejections")
+    for reason, count in rejections.items():
+        if not isinstance(reason, str) or not isinstance(count, int) or count < 0:
+            raise ValueError("singular gate rejection counts must be non-negative integers")
+    return summary
+
+
 def read_events(paths):
     events = []
     for path in paths:
@@ -61,6 +77,20 @@ def read_events(paths):
                     event["_line"] = line_number
                     events.append(event)
     return events
+
+
+def read_gate_rejections(paths):
+    rejections = Counter()
+    for path in paths:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line_number, line in enumerate(stream, 1):
+                try:
+                    summary = parse_gate_line(line)
+                except (json.JSONDecodeError, ValueError) as error:
+                    raise ValueError(f"{path}:{line_number}: {error}") from error
+                if summary is not None:
+                    rejections.update(summary["rejections"])
+    return rejections
 
 
 def percentile(values, percentage):
@@ -102,8 +132,8 @@ def group_summary(events, key):
     return {name: summarize_group(group) for name, group in sorted(groups.items())}
 
 
-def summarize(events):
-    return {
+def summarize(events, rejections=None):
+    report = {
         "overall": summarize_group(events),
         "by_depth": group_summary(events, lambda event: event["depth"]),
         "by_pv": group_summary(events, lambda event: event["pv"]),
@@ -119,6 +149,19 @@ def summarize(events):
         "by_capture": group_summary(events, lambda event: event["capture"]),
         "by_promotion": group_summary(events, lambda event: event["promotion"]),
     }
+    if rejections is not None:
+        rejected = sum(rejections.values())
+        eligible = len(events)
+        report["eligibility"] = {
+            "examined": rejected + eligible,
+            "eligible": eligible,
+            "eligible_rate": eligible / (rejected + eligible)
+            if rejected + eligible
+            else 0.0,
+            "rejected": rejected,
+            "rejections": dict(sorted(rejections.items())),
+        }
+    return report
 
 
 def parse_uci_info(line):
@@ -325,6 +368,19 @@ def render_markdown(report):
             )
         ),
     ]
+    eligibility = report["summary"].get("eligibility")
+    if eligibility is not None:
+        lines.extend(
+            [
+                "",
+                "## Eligibility funnel",
+                "",
+                f"- Examined nodes: {eligibility['examined']}",
+                f"- Eligible: {eligibility['eligible']} ({eligibility['eligible_rate']:.1%})",
+                f"- Rejected: {eligibility['rejected']}",
+                f"- Rejections: `{json.dumps(eligibility['rejections'], sort_keys=True)}`",
+            ]
+        )
     oracle = report.get("oracle")
     if oracle is not None:
         lines.extend(
@@ -372,12 +428,13 @@ def main(argv=None):
         raise SystemExit(f"oracle does not exist: {args.oracle}")
 
     events = read_events(args.traces)
+    gate_rejections = read_gate_rejections(args.traces)
     report = {
         "inputs": [
             {"path": str(path.resolve()), "sha256": sha256_file(path)}
             for path in args.traces
         ],
-        "summary": summarize(events),
+        "summary": summarize(events, gate_rejections),
     }
     if args.oracle is not None:
         with UciOracle(args.oracle, args.hash_mb) as oracle:

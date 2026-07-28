@@ -40,6 +40,20 @@ class TraceParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing fields"):
             MODULE.parse_trace_line(MODULE.TRACE_PREFIX + '{"fen":"x"}')
 
+    def test_parse_gate_line_accepts_rejection_counts(self):
+        summary = {
+            "depth": 12,
+            "rejections": {"shallow_node": 20, "unsupported_bound": 3},
+        }
+        line = MODULE.GATE_PREFIX + MODULE.json.dumps(summary)
+        self.assertEqual(MODULE.parse_gate_line(line), summary)
+
+    def test_parse_gate_line_rejects_negative_counts(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            MODULE.parse_gate_line(
+                MODULE.GATE_PREFIX + '{"rejections":{"shallow_node":-1}}'
+            )
+
 
 class TraceSummaryTests(unittest.TestCase):
     def test_summary_reports_verification_economics(self):
@@ -57,6 +71,20 @@ class TraceSummaryTests(unittest.TestCase):
         self.assertEqual(overall["verification_nodes"]["median"], 200)
         self.assertEqual(overall["verification_nodes"]["p95"], 300)
         self.assertEqual(overall["nodes_per_extension"], 600)
+
+    def test_summary_reports_candidate_rejection_funnel(self):
+        summary = MODULE.summarize(
+            [event(outcome="extended")],
+            MODULE.Counter({"shallow_node": 7, "unsupported_bound": 2}),
+        )
+        eligibility = summary["eligibility"]
+        self.assertEqual(eligibility["examined"], 10)
+        self.assertEqual(eligibility["eligible"], 1)
+        self.assertAlmostEqual(eligibility["eligible_rate"], 0.1)
+        self.assertEqual(
+            eligibility["rejections"],
+            {"shallow_node": 7, "unsupported_bound": 2},
+        )
 
 
 class UciParsingTests(unittest.TestCase):

@@ -87,10 +87,52 @@ enum SingularSearchOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SingularEligibility {
-    NoCandidate,
-    SafetyRejected,
+    NoCandidate(SingularRejection),
+    SafetyRejected(SingularRejection),
     Eligible(SingularCandidate),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum SingularRejection {
+    Disabled,
+    MissingTtEvidence,
+    UnsupportedBound,
+    ShallowNode,
+    ShallowTt,
+    StaleTt,
+    LowerBoundContext,
+    Root,
+    Nested,
+    InCheck,
+    DecisiveScore,
+    HalfmoveClock,
+    SearchCycle,
+    PriorRepetition,
+    Shuffling,
+    PathBudget,
+    IllegalTtMove,
+}
+
+const SINGULAR_REJECTION_NAMES: [&str; 17] = [
+    "disabled",
+    "missing_tt",
+    "unsupported_bound",
+    "shallow_node",
+    "shallow_tt",
+    "stale_tt",
+    "lower_bound_context",
+    "root",
+    "nested",
+    "in_check",
+    "decisive_score",
+    "halfmove_clock",
+    "search_cycle",
+    "prior_repetition",
+    "shuffling",
+    "path_budget",
+    "illegal_tt_move",
+];
 
 #[derive(Clone, Copy, Debug)]
 struct SingularEvidence {
@@ -301,40 +343,61 @@ fn singular_path_budget(depth: i32) -> u8 {
 
 fn singular_candidate(evidence: SingularEvidence) -> SingularEligibility {
     if !evidence.enabled {
-        return SingularEligibility::NoCandidate;
+        return SingularEligibility::NoCandidate(SingularRejection::Disabled);
+    }
+    if evidence.actual_depth < SINGULAR_MIN_DEPTH {
+        return SingularEligibility::NoCandidate(SingularRejection::ShallowNode);
     }
     let (Some(mv), Some(score), Some(flag)) =
         (evidence.tt_move, evidence.tt_score, evidence.tt_flag)
     else {
-        return SingularEligibility::NoCandidate;
+        return SingularEligibility::NoCandidate(SingularRejection::MissingTtEvidence);
     };
     let positive_extension = flag == TT_EXACT && evidence.tt_pv;
     let lower_bound_policy = evidence.allow_lower_bound && flag == TT_BETA;
     let reliable_bound = positive_extension || lower_bound_policy;
-    if !reliable_bound
-        || evidence.actual_depth < SINGULAR_MIN_DEPTH
-        || evidence.tt_depth < evidence.actual_depth - SINGULAR_TT_DEPTH_MARGIN
-        || evidence.tt_age > SINGULAR_MAX_TT_AGE
-        || lower_bound_policy
-            && (evidence.node_pv
-                || evidence.actual_depth < SINGULAR_POLICY_MIN_DEPTH
-                || evidence.node_beta.abs() >= MATE / 2
-                || score < evidence.node_beta)
-    {
-        return SingularEligibility::NoCandidate;
+    if !reliable_bound {
+        return SingularEligibility::NoCandidate(SingularRejection::UnsupportedBound);
     }
-    if evidence.ply == 0
-        || evidence.excluded_move.is_some()
-        || evidence.in_check
-        || score.abs() >= MATE / 2
-        || evidence.halfmove_clock >= SINGULAR_MAX_HALF_MOVE_CLOCK
-        || evidence.repetitions > 1
-        || evidence.repeated_after_root
-        || evidence.shuffling
-        || evidence.path_extensions >= singular_path_budget(evidence.actual_depth)
-        || !evidence.tt_move_is_legal
+    if evidence.tt_depth < evidence.actual_depth - SINGULAR_TT_DEPTH_MARGIN {
+        return SingularEligibility::NoCandidate(SingularRejection::ShallowTt);
+    }
+    if evidence.tt_age > SINGULAR_MAX_TT_AGE {
+        return SingularEligibility::NoCandidate(SingularRejection::StaleTt);
+    }
+    if lower_bound_policy
+        && (evidence.node_pv
+            || evidence.actual_depth < SINGULAR_POLICY_MIN_DEPTH
+            || evidence.node_beta.abs() >= MATE / 2
+            || score < evidence.node_beta)
     {
-        return SingularEligibility::SafetyRejected;
+        return SingularEligibility::NoCandidate(SingularRejection::LowerBoundContext);
+    }
+    let safety_rejection = if evidence.ply == 0 {
+        Some(SingularRejection::Root)
+    } else if evidence.excluded_move.is_some() {
+        Some(SingularRejection::Nested)
+    } else if evidence.in_check {
+        Some(SingularRejection::InCheck)
+    } else if score.abs() >= MATE / 2 {
+        Some(SingularRejection::DecisiveScore)
+    } else if evidence.halfmove_clock >= SINGULAR_MAX_HALF_MOVE_CLOCK {
+        Some(SingularRejection::HalfmoveClock)
+    } else if evidence.repeated_after_root {
+        Some(SingularRejection::SearchCycle)
+    } else if evidence.repetitions > 1 {
+        Some(SingularRejection::PriorRepetition)
+    } else if evidence.shuffling {
+        Some(SingularRejection::Shuffling)
+    } else if evidence.path_extensions >= singular_path_budget(evidence.actual_depth) {
+        Some(SingularRejection::PathBudget)
+    } else if !evidence.tt_move_is_legal {
+        Some(SingularRejection::IllegalTtMove)
+    } else {
+        None
+    };
+    if let Some(rejection) = safety_rejection {
+        return SingularEligibility::SafetyRejected(rejection);
     }
     SingularEligibility::Eligible(SingularCandidate {
         mv,
@@ -1114,6 +1177,7 @@ pub struct SearchDebugStats {
     pub singular_multicut_cutoffs: u64,
     pub singular_alternative_rejections: u64,
     pub singular_stop_rejections: u64,
+    singular_rejections: [u64; SINGULAR_REJECTION_NAMES.len()],
 }
 
 macro_rules! qsearch_mode_body {
@@ -1808,11 +1872,18 @@ macro_rules! negamax_mode_body {
             tt_move_is_legal,
         };
         let singular_adjustment = match singular_candidate(singular_evidence) {
-            SingularEligibility::NoCandidate => None,
-            SingularEligibility::SafetyRejected => {
+            SingularEligibility::NoCandidate(rejection) => {
+                #[cfg(feature = "search-debug")]
+                {
+                    $this.record_singular_rejection(rejection);
+                }
+                None
+            }
+            SingularEligibility::SafetyRejected(rejection) => {
                 #[cfg(feature = "search-debug")]
                 {
                     $this.debug.stats.singular_safety_rejections += 1;
+                    $this.record_singular_rejection(rejection);
                 }
                 None
             }
@@ -2803,6 +2874,13 @@ impl Searcher {
     }
 
     #[cfg(feature = "search-debug")]
+    fn record_singular_rejection(&mut self, rejection: SingularRejection) {
+        if rejection != SingularRejection::Disabled {
+            self.debug.stats.singular_rejections[rejection as usize] += 1;
+        }
+    }
+
+    #[cfg(feature = "search-debug")]
     #[allow(clippy::too_many_arguments)]
     pub fn emit_debug_root_trace(
         &self,
@@ -2814,6 +2892,21 @@ impl Searcher {
         score: i32,
         nodes: u64,
     ) {
+        if self.debug.trace_singular_candidates {
+            let rejections = SINGULAR_REJECTION_NAMES
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    format!("\"{name}\":{}", self.debug.stats.singular_rejections[index])
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "info string search-debug singular-gates \
+                 {{\"depth\":{depth},\"order\":{order},\"move\":\"{mv}\",\
+                 \"nodes\":{nodes},\"rejections\":{{{rejections}}}}}"
+            );
+        }
         if !self.debug.trace_roots {
             return;
         }
@@ -5972,9 +6065,10 @@ mod tests {
                 ..allowed_lower_bound
             },
         ];
-        assert!(no_candidate_cases
-            .into_iter()
-            .all(|case| singular_candidate(case) == SingularEligibility::NoCandidate));
+        assert!(no_candidate_cases.into_iter().all(|case| matches!(
+            singular_candidate(case),
+            SingularEligibility::NoCandidate(_)
+        )));
 
         let safety_cases = [
             SingularEvidence { ply: 0, ..evidence },
@@ -6012,9 +6106,47 @@ mod tests {
                 ..evidence
             },
         ];
-        assert!(safety_cases
-            .into_iter()
-            .all(|case| singular_candidate(case) == SingularEligibility::SafetyRejected));
+        assert!(safety_cases.into_iter().all(|case| matches!(
+            singular_candidate(case),
+            SingularEligibility::SafetyRejected(_)
+        )));
+    }
+
+    #[test]
+    fn singular_candidate_reports_the_first_rejection_reason() {
+        let mv = encode_move(0, 0, 0, 1, 0);
+        let evidence = qualifying_singular_evidence(mv);
+        assert_eq!(
+            singular_candidate(SingularEvidence {
+                actual_depth: SINGULAR_MIN_DEPTH - 1,
+                ..evidence
+            }),
+            SingularEligibility::NoCandidate(SingularRejection::ShallowNode)
+        );
+        assert_eq!(
+            singular_candidate(SingularEvidence {
+                repetitions: 2,
+                ..evidence
+            }),
+            SingularEligibility::SafetyRejected(SingularRejection::PriorRepetition)
+        );
+        assert_eq!(
+            singular_candidate(SingularEvidence {
+                repetitions: 2,
+                repeated_after_root: true,
+                ..evidence
+            }),
+            SingularEligibility::SafetyRejected(SingularRejection::SearchCycle)
+        );
+        assert_eq!(
+            singular_candidate(SingularEvidence {
+                repetitions: 2,
+                repeated_after_root: true,
+                tt_move_is_legal: false,
+                ..evidence
+            }),
+            SingularEligibility::SafetyRejected(SingularRejection::SearchCycle)
+        );
     }
 
     #[test]
